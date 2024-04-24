@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,12 +14,19 @@ import (
 
 var batchSize int = 1_000_000
 var billion int = 1_000_000_000
+var chunkSize int64 = 1_000_000
+var inputFile string = "samples/measurements.txt"
 
 type Details struct {
 	sum   float32
 	count int
 	min   float32
 	max   float32
+}
+
+type ReadTask struct {
+	begin int64
+	end   int64
 }
 
 func Min(x float32, y float32) float32 {
@@ -33,9 +41,56 @@ func Max(x float32, y float32) float32 {
 	}
 	return x
 }
+func check(e error) {
+	if e != nil {
+		panic(e)
+	}
+}
+
+func getFileSize() int64 {
+	fi, err := os.Stat(inputFile)
+	check(err)
+	return fi.Size()
+}
+
+func fileReader2(c chan<- []string, in <-chan ReadTask) {
+	file, err := os.Open(inputFile)
+	check(err)
+	defer file.Close()
+
+	for task := range in {
+
+		file.Seek(task.begin, 0)
+		char := make([]byte, 1)
+		if task.begin != 0 {
+			for {
+				file.Read(char)
+				task.begin += 1
+				if string(char) == "\n" {
+					break
+				}
+			}
+		}
+		file.Seek(task.end, 0)
+		for {
+			file.Read(char)
+			if string(char) == "\n" {
+				break
+			}
+			task.end += 1
+		}
+		file.Seek(task.begin, 0)
+		input := make([]byte, task.end-task.begin)
+		file.Read(input)
+
+		lines := strings.Split(string(input), "\n")
+
+		c <- lines
+	}
+}
 
 func fileReader(c chan<- []string, begin int, end int) {
-	file, err := os.Open("samples/measurements.txt")
+	file, err := os.Open(inputFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -71,13 +126,17 @@ func processResults(in <-chan []string, out chan<- map[string]Details) {
 	for batch := range in {
 		for _, line := range batch {
 
-			d := strings.Split(line, ";")
-			station := d[0]
-			t, _ := strconv.ParseFloat(d[1], 32)
+			splitIndex := strings.Index(line, ";")
+			if splitIndex == -1 {
+				fmt.Print(line)
+				fmt.Print(" - Error here\n")
+				continue
+			}
+			t, _ := strconv.ParseFloat(line[splitIndex+1:], 32)
 
 			temp := float32(t)
 
-			current, err := details[station]
+			current, err := details[line[:splitIndex]]
 
 			var sum float32
 			var count int
@@ -93,7 +152,7 @@ func processResults(in <-chan []string, out chan<- map[string]Details) {
 				max = Max(current.max, temp)
 			}
 
-			details[station] = Details{sum: sum, count: count, min: min, max: max}
+			details[line[:splitIndex]] = Details{sum: sum, count: count, min: min, max: max}
 		}
 		out <- details
 		details = make(map[string]Details)
@@ -104,7 +163,7 @@ func aggregateOutput(in <-chan map[string]Details, done chan<- int) {
 
 	details := make(map[string]Details)
 
-	cnt := 0
+	// cnt := 0
 
 	for result_batch := range in {
 		for station, detail := range result_batch {
@@ -125,10 +184,10 @@ func aggregateOutput(in <-chan map[string]Details, done chan<- int) {
 
 			details[station] = Details{sum: sum, count: count, min: min, max: max}
 		}
-		cnt += 1
-		if cnt%10 == 0 {
-			fmt.Printf("Aggregator batch - %d/%d=%f\n", cnt, billion/batchSize, float64((float32(cnt)/float32(billion/batchSize))*100))
-		}
+		// cnt += 1
+		// if cnt%10 == 0 {
+		// 	fmt.Printf("Aggregator batch - %d/%d=%f\n", cnt, billion/batchSize, float64((float32(cnt)/float32(billion/batchSize))*100))
+		// }
 	}
 	// Print output
 	output := "{"
@@ -142,20 +201,37 @@ func aggregateOutput(in <-chan map[string]Details, done chan<- int) {
 }
 
 func main() {
+	// Start profiling
+	f, err := os.Create("myprogram.prof")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
+
 	start := time.Now()
 
+	read_tasks := make(chan ReadTask, 1000000)
 	file_input := make(chan []string, 100)
 	result_output := make(chan map[string]Details, 100)
 	done := make(chan int)
 
 	var fileWg sync.WaitGroup
 
-	readers := 6
-	for i := 0; i < readers; i++ {
+	fileSize := getFileSize()
+
+	chunks := (fileSize + chunkSize - 1) / chunkSize
+
+	for i := int64(0); i < chunks; i++ {
+		read_tasks <- ReadTask{chunkSize * i, chunkSize * (i + 1)}
+	}
+
+	for i := 0; i < 10; i++ {
 		fileWg.Add(1)
 		go func() {
 			defer fileWg.Done()
-			fileReader(file_input, (billion/readers)*i, (billion/readers)*(i+1))
+			fileReader2(file_input, read_tasks)
 		}()
 	}
 
@@ -170,6 +246,8 @@ func main() {
 
 	go aggregateOutput(result_output, done)
 
+	close(read_tasks)
+
 	fileWg.Wait()
 	close(file_input)
 
@@ -180,4 +258,5 @@ func main() {
 
 	elapsed := time.Since(start)
 	log.Printf("Took %s", elapsed)
+
 }
