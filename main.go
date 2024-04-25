@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"log"
 	"os"
@@ -14,8 +13,8 @@ import (
 
 var batchSize int = 1_000_000
 var billion int = 1_000_000_000
-var chunkSize int64 = 1_000_000
-var inputFile string = "samples/measurements.txt"
+var chunkSize int64 = 1
+var inputFile = "samples/measurements-10.txt"
 
 type Details struct {
 	sum   float32
@@ -27,6 +26,59 @@ type Details struct {
 type ReadTask struct {
 	begin int64
 	end   int64
+}
+
+type TaskWorker struct {
+	station string
+	detail  Details
+}
+
+func GetTaskWorker(station string, input <-chan string, result chan<- TaskWorker) {
+	var details Details
+	init := false
+	for row := range input {
+		t, _ := strconv.ParseFloat(row, 32)
+		temp := float32(t)
+		if !init {
+			details.count = 1
+			details.sum = temp
+			details.min = temp
+			details.max = temp
+		} else {
+			details.sum = details.sum + temp
+			details.count = details.count + 1
+			details.min = Min(details.min, temp)
+			details.max = Max(details.max, temp)
+		}
+	}
+	result <- TaskWorker{
+		station: station,
+		detail:  details,
+	}
+}
+
+func CreateTaskWorker(station string, tempString string) TaskWorker {
+	t, _ := strconv.ParseFloat(tempString, 32)
+	temp := float32(t)
+	return TaskWorker{
+		station: station,
+		detail: Details{
+			sum:   temp,
+			count: 1,
+			min:   temp,
+			max:   temp,
+		},
+	}
+}
+
+func ProcessRow(worker *TaskWorker, tempString string) {
+	t, _ := strconv.ParseFloat(tempString, 32)
+	temp := float32(t)
+
+	worker.detail.sum = worker.detail.sum + temp
+	worker.detail.count = worker.detail.count + 1
+	worker.detail.min = Min(worker.detail.min, temp)
+	worker.detail.max = Max(worker.detail.max, temp)
 }
 
 func Min(x float32, y float32) float32 {
@@ -53,7 +105,7 @@ func getFileSize() int64 {
 	return fi.Size()
 }
 
-func fileReader2(c chan<- []string, in <-chan ReadTask) {
+func fileReader(c chan<- []string, in <-chan ReadTask) {
 	file, err := os.Open(inputFile)
 	check(err)
 	defer file.Close()
@@ -80,6 +132,9 @@ func fileReader2(c chan<- []string, in <-chan ReadTask) {
 			task.end += 1
 		}
 		file.Seek(task.begin, 0)
+		if task.end-task.begin < 0 {
+			return
+		}
 		input := make([]byte, task.end-task.begin)
 		file.Read(input)
 
@@ -89,40 +144,9 @@ func fileReader2(c chan<- []string, in <-chan ReadTask) {
 	}
 }
 
-func fileReader(c chan<- []string, begin int, end int) {
-	file, err := os.Open(inputFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	cnt := 0
-	buffer := make([]string, batchSize)
-	for scanner.Scan() {
-		if cnt < begin {
-			continue
-		}
-		if cnt > end {
-			break
-		}
-		line := scanner.Text()
-		if line == "" {
-			break
-		}
-		buffer[cnt%batchSize] = line
-		cnt += 1
-		if cnt%batchSize == 0 {
-			c <- buffer
-			buffer = make([]string, batchSize)
-		}
-		if cnt%1000000 == 0 {
-			fmt.Printf("Reader - %d/%d=%f\n", cnt, billion, float64((float32(cnt)/float32(billion))*100))
-		}
-	}
-}
-
-func processResults(in <-chan []string, out chan<- map[string]Details) {
-	details := make(map[string]Details)
+func processResults(in <-chan []string, result chan<- TaskWorker) {
+	workerMap := make(map[string]chan string)
+	results := make(chan TaskWorker)
 	for batch := range in {
 		for _, line := range batch {
 
@@ -132,30 +156,25 @@ func processResults(in <-chan []string, out chan<- map[string]Details) {
 				fmt.Print(" - Error here\n")
 				continue
 			}
-			t, _ := strconv.ParseFloat(line[splitIndex+1:], 32)
 
-			temp := float32(t)
+			station := line[:splitIndex]
 
-			current, err := details[line[:splitIndex]]
-
-			var sum float32
-			var count int
-			var min float32
-			var max float32
-
-			if !err {
-				sum, count, min, max = temp, 1, temp, temp
+			worker, ok := workerMap[station]
+			if !ok {
+				input := make(chan string)
+				go GetTaskWorker(station, input, results)
+				input <- line[splitIndex+1:]
+				workerMap[station] = input
 			} else {
-				sum = current.sum + temp
-				count = current.count + 1
-				min = Min(current.min, temp)
-				max = Max(current.max, temp)
+				worker <- line[splitIndex+1:]
 			}
-
-			details[line[:splitIndex]] = Details{sum: sum, count: count, min: min, max: max}
 		}
-		out <- details
-		details = make(map[string]Details)
+	}
+	for _, c := range workerMap {
+		close(c)
+	}
+	for r := range results {
+		result <- r
 	}
 }
 
@@ -214,8 +233,7 @@ func main() {
 
 	read_tasks := make(chan ReadTask, 1000000)
 	file_input := make(chan []string, 100)
-	result_output := make(chan map[string]Details, 100)
-	done := make(chan int)
+	resultChan := make(chan TaskWorker, 10000)
 
 	var fileWg sync.WaitGroup
 
@@ -231,30 +249,31 @@ func main() {
 		fileWg.Add(1)
 		go func() {
 			defer fileWg.Done()
-			fileReader2(file_input, read_tasks)
+			fileReader(file_input, read_tasks)
 		}()
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 1; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			processResults(file_input, result_output)
+			processResults(file_input, resultChan)
 		}()
 	}
-
-	go aggregateOutput(result_output, done)
 
 	close(read_tasks)
 
 	fileWg.Wait()
 	close(file_input)
 
-	wg.Wait()
-	close(result_output)
-
-	<-done
+	output := "{"
+	for results := range resultChan {
+		output += fmt.Sprintf("%s=%.1f/%.1f/%.1f, ", results.station, results.detail.min, results.detail.sum/float32(results.detail.count), results.detail.max)
+	}
+	output = strings.TrimSuffix(output, ", ")
+	output += "}\n"
+	fmt.Print(output)
 
 	elapsed := time.Since(start)
 	log.Printf("Took %s", elapsed)
